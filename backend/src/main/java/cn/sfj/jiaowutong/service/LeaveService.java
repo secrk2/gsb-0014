@@ -265,6 +265,13 @@ public class LeaveService {
     public LeaveView bureauDecide(Long id, LeaveDecisionRequest req, LoginUser user) {
         assertSupervisor(user);
         LeaveApplication leave = loadVisible(id, user);
+        // 环节校验：仅「待区局复核」可裁。司法所退回/对象撤回/他人已抢先处理过的单子，
+        // 不得用旧页面快照覆盖既有结论（撞单时后到请求一律拒绝，提示刷新）
+        if (leave.getStatus() != LeaveApplication.Status.PENDING_BUREAU) {
+            throw ApiException.badRequest("LEAVE_WRONG_STAGE",
+                    "该单不在「待区局复核」环节，当前状态：" + leave.getStatus().getLabel()
+                            + "；请刷新列表确认最新状态后再操作");
+        }
         CorrectionObject obj = leave.getOffender();
         Instant now = Instant.now();
         if (Boolean.TRUE.equals(req.approve())) {
@@ -323,7 +330,7 @@ public class LeaveService {
     /** 单个时刻是否落在任一准假窗口 [start,end]（含边界） */
     public static boolean withinAnyLeave(List<LeaveApplication> leaves, Instant at) {
         for (LeaveApplication l : leaves) {
-            if (at.isAfter(l.getStartTime()) && at.isBefore(l.getEndTime())) {
+            if (!at.isBefore(l.getStartTime()) && !at.isAfter(l.getEndTime())) {
                 return true;
             }
         }
@@ -335,7 +342,7 @@ public class LeaveService {
         return leaveRepository.findAll().stream()
                 .filter(l -> l.getOffender().getId().equals(offenderId))
                 .filter(l -> AWAY_STATUSES.contains(l.getStatus()))
-                .filter(l -> at.isAfter(l.getStartTime()) && at.isBefore(l.getEndTime()))
+                .filter(l -> !at.isBefore(l.getStartTime()) && !at.isAfter(l.getEndTime()))
                 .findFirst();
     }
 
@@ -344,7 +351,7 @@ public class LeaveService {
     public java.util.Set<Long> offenderIdsOnLeaveAt(Instant at) {
         return leaveRepository.findAll().stream()
                 .filter(l -> AWAY_STATUSES.contains(l.getStatus()))
-                .filter(l -> at.isAfter(l.getStartTime()) && at.isBefore(l.getEndTime()))
+                .filter(l -> !at.isBefore(l.getStartTime()) && !at.isAfter(l.getEndTime()))
                 .map(l -> l.getOffender().getId())
                 .collect(java.util.stream.Collectors.toSet());
     }
@@ -353,25 +360,28 @@ public class LeaveService {
      * 定时扫描：已批准且截止时刻已过仍未销假 → 自动升违规。
      * 每 60 秒一次；服务启动 20 秒后先跑一遍。findByStatusAndEndTimeBefore 带悲观锁，
      * 多实例部署不会重复升违规。
+     *
+     * <p>只扫 APPROVED：OVERDUE 表示逾假违规已生成（幂等，不重复升），
+     * COMPLETED 表示已销假（按期或逾假后），绝不再翻回逾假。
      */
     @Scheduled(fixedDelay = 60_000L, initialDelay = 20_000L)
     @Transactional
     public void sweepOverdueLeaves() {
         Instant now = Instant.now();
-        // 已批准、已逾期、已销假但截止时间已过的都扫一遍，确保不漏
-        List<LeaveApplication> due = leaveRepository.findByStatusInOrderByCreatedAtDescIdDesc(List.of(
-                        LeaveApplication.Status.APPROVED,
-                        LeaveApplication.Status.OVERDUE,
-                        LeaveApplication.Status.COMPLETED))
-                .stream()
-                .filter(l -> l.getEndTime().isBefore(now))
-                .toList();
+        List<LeaveApplication> due = leaveRepository
+                .findByStatusAndEndTimeBefore(LeaveApplication.Status.APPROVED, now);
         for (LeaveApplication leave : due) {
             markOverdue(leave, now);
         }
     }
 
     private void markOverdue(LeaveApplication leave, Instant now) {
+        // 幂等兜底：仅「已批准·假期中」且未生成过逾假违规的单可升逾假；
+        // 已销假/已逾假的单重复进入一律跳过，不重复生成违规、不重复升状态
+        if (leave.getStatus() != LeaveApplication.Status.APPROVED
+                || Boolean.TRUE.equals(leave.getOverdueFlag())) {
+            return;
+        }
         CorrectionObject obj = leave.getOffender();
         leave.setStatus(LeaveApplication.Status.OVERDUE);
         leave.setOverdueFlag(true);

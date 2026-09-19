@@ -122,6 +122,64 @@ class LeaveActivityIntegrationTest {
     }
 
     @Test
+    void bureauDecisionCannotOverrideOtherStageOutcomes() {
+        // 撞单回归：司法所已退回（RETURNED）的单，区局用旧页面快照提交复核通过，
+        // 必须被拒绝且退回结论/留痕不被覆盖（此前 bureauDecide 缺环节校验会被直接盖掉）
+        CorrectionObject zhou = byNo("JWT26009"); // 周文斌：司法所已退回·待修改重提
+        LeaveApplication returned = leaveRepository
+                .findByOffender_IdOrderByCreatedAtDescIdDesc(zhou.getId()).get(0);
+        assertEquals(LeaveApplication.Status.RETURNED, returned.getStatus());
+
+        ApiException ex = assertThrows(ApiException.class, () -> leaveService.bureauDecide(
+                returned.getId(), new LeaveDecisionRequest(true, "旧页面快照提交的复核通过"), supervisor()));
+        assertEquals("LEAVE_WRONG_STAGE", ex.getCode());
+        LeaveApplication after = leaveRepository.findById(returned.getId()).orElseThrow();
+        assertEquals(LeaveApplication.Status.RETURNED, after.getStatus(),
+                "司法所的退回结论不得被区局的迟到提交覆盖");
+
+        // 已逾期的单同样不在区局复核环节，不能借旧快照改判
+        CorrectionObject wu = byNo("JWT26010"); // 吴桂芳：逾假未归（OVERDUE）
+        LeaveApplication overdue = leaveRepository
+                .findByOffender_IdOrderByCreatedAtDescIdDesc(wu.getId()).get(0);
+        assertEquals(LeaveApplication.Status.OVERDUE, overdue.getStatus());
+        ApiException ex2 = assertThrows(ApiException.class, () -> leaveService.bureauDecide(
+                overdue.getId(), new LeaveDecisionRequest(false, "旧页面快照提交的复核退回"), supervisor()));
+        assertEquals("LEAVE_WRONG_STAGE", ex2.getCode());
+    }
+
+    @Test
+    void overdueSweepIsIdempotentAndNeverTouchesCompleted() {
+        CorrectionObject yang = byNo("JWT26006"); // 杨春生：已按期销假（COMPLETED，截止于 9 天前）
+        CorrectionObject wu = byNo("JWT26010");   // 吴桂芳：逾假未归（OVERDUE，违规已生成）
+
+        assertEquals(0, countLeaveOverdue(yang.getId()), "按期销假的对象不应有逾假违规");
+        assertEquals(1, countLeaveOverdue(wu.getId()), "种子数据已含 1 条逾假违规");
+
+        // 连续巡检两轮（模拟 60s 周期反复触发）
+        leaveService.sweepOverdueLeaves();
+        leaveService.sweepOverdueLeaves();
+
+        // 已按期销假的单绝不被翻回逾假，对象状态不被误升
+        LeaveApplication yangLv = leaveRepository
+                .findByOffender_IdOrderByCreatedAtDescIdDesc(yang.getId()).get(0);
+        assertEquals(LeaveApplication.Status.COMPLETED, yangLv.getStatus());
+        assertEquals(CorrectionStatus.SERVING,
+                objectRepository.findById(yang.getId()).orElseThrow().getStatus());
+
+        // 违规记录与逾假状态不重复生成
+        assertEquals(0, countLeaveOverdue(yang.getId()), "已销假对象不得新增逾假违规");
+        assertEquals(1, countLeaveOverdue(wu.getId()), "已逾假的单不得重复生成违规");
+        LeaveApplication wuLv = leaveRepository
+                .findByOffender_IdOrderByCreatedAtDescIdDesc(wu.getId()).get(0);
+        assertEquals(LeaveApplication.Status.OVERDUE, wuLv.getStatus());
+    }
+
+    private long countLeaveOverdue(Long offenderId) {
+        return violationRepository.findTop20ByOffender_IdOrderByEventTimeDesc(offenderId).stream()
+                .filter(v -> "LEAVE_OVERDUE".equals(v.getType())).count();
+    }
+
+    @Test
     void overdueLeaveAutoEscalatesThenReturnRestoresServing() {
         CorrectionObject mait = byNo("JWT26013"); // 买买提·伊宁·在矫
         // 直接构造一张已批准且到期未销假的单子（绕过申请时段校验），并把对象置请假外出

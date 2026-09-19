@@ -531,8 +531,8 @@ public class DataInitializer implements ApplicationRunner {
         leaveRepository.save(sunLv);
         leaveEvent(sunLv, "SUBMITTED", 0L, sun.getFullName(), "提交请假申请：就医检查", now.minusSeconds(6 * 3600));
 
-        // 启动预热：先取一条到期未销假的样本，避免首次定时巡检抖动
-        leaveRepository.findByStatusAndEndTimeBefore(LeaveApplication.Status.APPROVED, now).get(0);
+        // 启动预热：触发一次到期未销假查询，避免首次定时巡检抖动（结果为空属正常，勿取首条）
+        leaveRepository.findByStatusAndEndTimeBefore(LeaveApplication.Status.APPROVED, now).size();
 
         // ---------------- 公益活动 ----------------
         // A) 青山·进行中（打卡窗覆盖当前）：杨春生范围内正常、陈大山范围外异常

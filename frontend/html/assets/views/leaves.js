@@ -181,9 +181,11 @@
       } catch (e) {
         if (e && e.message === 'cancel') return;
         if (e.code === 'LEAVE_WRONG_STAGE' || e.code === 'RETURN_REASON_REQUIRED'
-            || e.code === 'FORBIDDEN' || e.code === 'INVALID_TRANSITION') {
+            || e.code === 'FORBIDDEN' || e.code === 'INVALID_TRANSITION'
+            || e.code === 'CONCURRENT_MODIFICATION') {
           UI.alertModal('操作未完成',
             `<div style="font-size:13.5px;line-height:1.7">${UI.esc(e.message)}</div>`, '⛔');
+          load();
         } else if (e.message) {
           UI.toast(e.message, 'error');
         }

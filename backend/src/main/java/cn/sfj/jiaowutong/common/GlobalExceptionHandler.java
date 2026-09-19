@@ -2,6 +2,9 @@ package cn.sfj.jiaowutong.common;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.dao.CannotAcquireLockException;
+import org.springframework.dao.OptimisticLockingFailureException;
+import org.springframework.dao.PessimisticLockingFailureException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
@@ -29,6 +32,18 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ApiResult<Void>> handleApi(ApiException ex) {
         HttpStatus http = STATUS_MAP.getOrDefault(ex.getCode(), HttpStatus.BAD_REQUEST);
         return ResponseEntity.status(http).body(ApiResult.error(ex.getCode(), ex.getMessage()));
+    }
+
+    /**
+     * 并发撞单：两人同时处理同一张单（如司法所初审与区局复核撞在一起），
+     * 后到请求被乐观/悲观锁拦下——不覆盖先到者的结论，返回 409 提示刷新后确认最新状态。
+     */
+    @ExceptionHandler({OptimisticLockingFailureException.class,
+            PessimisticLockingFailureException.class, CannotAcquireLockException.class})
+    public ResponseEntity<ApiResult<Void>> handleConcurrencyConflict(Exception ex) {
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(ApiResult.error("CONCURRENT_MODIFICATION",
+                        "该单据刚被他人处理，结论已发生变化，请刷新列表确认最新状态后再操作"));
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)
