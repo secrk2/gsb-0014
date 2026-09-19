@@ -41,6 +41,7 @@ class LeaveActivityIntegrationTest {
     @Autowired private CorrectionObjectRepository objectRepository;
     @Autowired private JudicialOfficeRepository officeRepository;
     @Autowired private LeaveApplicationRepository leaveRepository;
+    @Autowired private LeaveEventRepository leaveEventRepository;
     @Autowired private ViolationEventRepository violationRepository;
     @Autowired private TrackPointRepository trackPointRepository;
 
@@ -151,6 +152,133 @@ class LeaveActivityIntegrationTest {
                 objectRepository.findById(mait.getId()).orElseThrow().getStatus());
         LeaveApplication completed = leaveRepository.findById(lv.getId()).orElseThrow();
         assertEquals(LeaveApplication.Status.COMPLETED, completed.getStatus());
+    }
+
+    @Test
+    void bureauCannotOverrideOfficeOrFinalConclusion() {
+        CorrectionObject sun = byNo("JWT26012"); // 孙满堂·龙湖·在矫
+        LoginUser he = offender(sun);
+        LoginUser longhuStaff = staff("JGS-LH");
+        Instant now = Instant.now();
+        leaveRepository.deleteAll(
+                leaveRepository.findByOffender_IdOrderByCreatedAtDescIdDesc(sun.getId()));
+
+        LeaveView v1 = leaveService.apply(new LeaveApplyRequest("PERSONAL", "测试两级审批结论不可互相覆盖",
+                "邻市", now.minusSeconds(60), now.plusSeconds(1800)), he);
+
+        // 司法所初审通过并留下初审意见
+        leaveService.officeDecide(v1.id(),
+                new LeaveDecisionRequest(true, "初审意见-必须保留"), longhuStaff);
+
+        // 区局还没轮到时，司法所不能对同一单二次初审（防并发/重复提交覆盖）
+        ApiException officeAgain = assertThrows(ApiException.class,
+                () -> leaveService.officeDecide(v1.id(),
+                        new LeaveDecisionRequest(false, "司法所反悔想退回"), longhuStaff));
+        assertEquals("LEAVE_WRONG_STAGE", officeAgain.getCode());
+
+        // 区局正常终批
+        leaveService.bureauDecide(v1.id(),
+                new LeaveDecisionRequest(true, "区局意见-准予外出"), supervisor());
+        assertEquals(LeaveApplication.Status.APPROVED.name(),
+                leaveRepository.findById(v1.id()).orElseThrow().getStatus().name());
+
+        // 终批之后区局再点“退回/改判”必须被拒，不能把已准假单翻成已退回
+        ApiException afterFinal = assertThrows(ApiException.class,
+                () -> leaveService.bureauDecide(v1.id(),
+                        new LeaveDecisionRequest(false, "区局事后想退回覆盖"), supervisor()));
+        assertEquals("LEAVE_WRONG_STAGE", afterFinal.getCode());
+
+        LeaveApplication unchanged = leaveRepository.findById(v1.id()).orElseThrow();
+        assertEquals(LeaveApplication.Status.APPROVED, unchanged.getStatus(),
+                "后提交的越环节操作不得覆盖已终批结论");
+        List<LeaveEvent> events = leaveEventRepository
+                .findByLeaveIdOrderByOccurredAtAscIdAsc(v1.id());
+        assertTrue(events.stream().anyMatch(e -> "OFFICE_APPROVED".equals(e.getAction())
+                        && "初审意见-必须保留".equals(e.getComment())),
+                "司法所初审意见必须保留，未被区局覆盖");
+        assertTrue(events.stream().anyMatch(e -> "BUREAU_APPROVED".equals(e.getAction())
+                && "区局意见-准予外出".equals(e.getComment())), "区局终批意见应保留");
+        assertFalse(events.stream().anyMatch(e -> "BUREAU_RETURNED".equals(e.getAction())),
+                "被拒的越环节退回不得产生退回流水");
+
+        // 还原孙满堂到在矫/无在途单，避免影响同库其他用例
+        leaveService.returnCheckin(v1.id(), "测试用例清理销假", he);
+        assertEquals(CorrectionStatus.SERVING,
+                objectRepository.findById(sun.getId()).orElseThrow().getStatus());
+    }
+
+    @Test
+    void overdueSweepIsIdempotentAndNeverReopensCompletedLeave() {
+        JudicialOffice lh = officeRepository.findAll().stream()
+                .filter(x -> x.getCode().equals("JGS-LH")).findFirst().orElseThrow();
+        Instant now = Instant.now();
+
+        // 场景一：到期未销假 → 巡检只升一次；反复巡检不得重复登记违规/重复升状态
+        CorrectionObject overdueObj = new CorrectionObject();
+        overdueObj.setCorrectionNo("JWT-TEST-OVERDUE-1");
+        overdueObj.setFullName("测试逾假");
+        overdueObj.setMaskedName("T-OVERDUE-1");
+        overdueObj.setOffice(lh);
+        overdueObj.setStatus(CorrectionStatus.LEAVE);
+        objectRepository.save(overdueObj);
+        LeaveApplication overdueLv = new LeaveApplication(overdueObj, "PERSONAL", "测试逾假幂等", "外地",
+                now.minusSeconds(3 * 3600), now.minusSeconds(3600),
+                LeaveApplication.Status.APPROVED, now.minusSeconds(4 * 3600));
+        leaveRepository.save(overdueLv);
+
+        leaveService.sweepOverdueLeaves();
+        leaveService.sweepOverdueLeaves();
+        leaveService.sweepOverdueLeaves();
+
+        assertEquals(LeaveApplication.Status.OVERDUE,
+                leaveRepository.findById(overdueLv.getId()).orElseThrow().getStatus());
+        assertEquals(CorrectionStatus.ADMONISHED,
+                objectRepository.findById(overdueObj.getId()).orElseThrow().getStatus());
+        long violationCount = violationRepository
+                .findTop20ByOffender_IdOrderByEventTimeDesc(overdueObj.getId()).stream()
+                .filter(v -> "LEAVE_OVERDUE".equals(v.getType())).count();
+        assertEquals(1, violationCount, "逾假违规红点只允许生成一次，巡检重复执行不得叠加");
+        long sysEventCount = leaveEventRepository
+                .findByLeaveIdOrderByOccurredAtAscIdAsc(overdueLv.getId()).stream()
+                .filter(e -> "SYSTEM_OVERDUE".equals(e.getAction())).count();
+        assertEquals(1, sysEventCount, "系统逾假判定流水只允许一条");
+
+        // 场景二：按期销假（COMPLETED）后，巡检不得翻案、不得补判逾假
+        CorrectionObject backObj = new CorrectionObject();
+        backObj.setCorrectionNo("JWT-TEST-OVERDUE-2");
+        backObj.setFullName("测试按期销假");
+        backObj.setMaskedName("T-OVERDUE-2");
+        backObj.setOffice(lh);
+        backObj.setStatus(CorrectionStatus.LEAVE);
+        objectRepository.save(backObj);
+        // 与真实办理过程一致：假期 [now-3h, now-60s]，对象在截止前一刻销假返所、状态回在矫
+        LeaveApplication backLv = new LeaveApplication(backObj, "PERSONAL", "测试按期销假不翻案", "外地",
+                now.minusSeconds(3 * 3600), now.minusSeconds(60),
+                LeaveApplication.Status.APPROVED, now.minusSeconds(4 * 3600));
+        leaveRepository.save(backLv);
+        backLv.setStatus(LeaveApplication.Status.COMPLETED);
+        backLv.setActualReturnAt(now.minusSeconds(120));
+        leaveRepository.save(backLv);
+        leaveEventRepository.save(new LeaveEvent(backLv.getId(), "RETURN_CHECKIN",
+                LeaveApplication.Status.COMPLETED, backObj.getId(), backObj.getFullName(),
+                "已按期返所销假", now.minusSeconds(120)));
+        backObj.setStatus(CorrectionStatus.SERVING);
+        objectRepository.save(backObj);
+
+        // 巡检多跑几轮：截止时间已过，但对象已按期销假
+        leaveService.sweepOverdueLeaves();
+        leaveService.sweepOverdueLeaves();
+
+        assertEquals(LeaveApplication.Status.COMPLETED,
+                leaveRepository.findById(backLv.getId()).orElseThrow().getStatus(),
+                "已按期销假的单不得被巡检翻成逾假未归");
+        assertEquals(CorrectionStatus.SERVING,
+                objectRepository.findById(backObj.getId()).orElseThrow().getStatus(),
+                "销假恢复在矫后不得被巡检再升训诫");
+        assertFalse(violationRepository
+                        .findTop20ByOffender_IdOrderByEventTimeDesc(backObj.getId()).stream()
+                        .anyMatch(v -> "LEAVE_OVERDUE".equals(v.getType())),
+                "按期销假不得生成任何逾假违规红点");
     }
 
     @Test

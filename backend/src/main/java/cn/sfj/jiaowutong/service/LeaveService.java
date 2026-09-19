@@ -121,6 +121,9 @@ public class LeaveService {
         leave.setStatus(LeaveApplication.Status.PENDING_OFFICE);
         leave.setResubmittedAt(now);
         leave.setReturnedAt(null);
+        // 新一轮审批从零走起：清空上轮两级审批结论时间，旧结论仍保留在 LeaveEvent 流水里可回溯
+        leave.setOfficeApprovedAt(null);
+        leave.setBureauApprovedAt(null);
         leave = leaveRepository.save(leave);
         record(leave, "RESUBMITTED", user.userId(), user.realName(),
                 "退回后修改重提：" + req.reason().trim());
@@ -266,6 +269,11 @@ public class LeaveService {
         assertSupervisor(user);
         LeaveApplication leave = loadVisible(id, user);
         CorrectionObject obj = leave.getOffender();
+        if (leave.getStatus() != LeaveApplication.Status.PENDING_BUREAU) {
+            throw ApiException.badRequest("LEAVE_WRONG_STAGE",
+                    "该单不在「待区局复核」环节，当前状态：" + leave.getStatus().getLabel()
+                            + "；区局不能覆盖司法所初审或已终批的结论，请刷新后按当前环节办理");
+        }
         Instant now = Instant.now();
         if (Boolean.TRUE.equals(req.approve())) {
             // 终批：按状态机 SERVING→LEAVE，写状态流转留痕
@@ -288,7 +296,7 @@ public class LeaveService {
             requireReturnReason(req.comment());
             leave.setStatus(LeaveApplication.Status.RETURNED);
             leave.setReturnedAt(now);
-            // 初审通过标记保留，重提后再次走到区局会覆盖 officeApprovedAt；这里退回流水单独留痕
+            // 初审通过标记暂保留，对象重提时会与区局终批标记一并清空，从头走两级；本轮退回流水单独留痕
             leaveRepository.save(leave);
             record(leave, "BUREAU_RETURNED", user.userId(), user.realName(), req.comment().trim());
         }
@@ -320,10 +328,10 @@ public class LeaveService {
                 .toList();
     }
 
-    /** 单个时刻是否落在任一准假窗口 [start,end]（含边界） */
+    /** 单个时刻是否落在任一准假窗口 [start,end]（含起止边界） */
     public static boolean withinAnyLeave(List<LeaveApplication> leaves, Instant at) {
         for (LeaveApplication l : leaves) {
-            if (at.isAfter(l.getStartTime()) && at.isBefore(l.getEndTime())) {
+            if (!at.isBefore(l.getStartTime()) && !at.isAfter(l.getEndTime())) {
                 return true;
             }
         }
@@ -335,7 +343,7 @@ public class LeaveService {
         return leaveRepository.findAll().stream()
                 .filter(l -> l.getOffender().getId().equals(offenderId))
                 .filter(l -> AWAY_STATUSES.contains(l.getStatus()))
-                .filter(l -> at.isAfter(l.getStartTime()) && at.isBefore(l.getEndTime()))
+                .filter(l -> !at.isBefore(l.getStartTime()) && !at.isAfter(l.getEndTime()))
                 .findFirst();
     }
 
@@ -344,7 +352,7 @@ public class LeaveService {
     public java.util.Set<Long> offenderIdsOnLeaveAt(Instant at) {
         return leaveRepository.findAll().stream()
                 .filter(l -> AWAY_STATUSES.contains(l.getStatus()))
-                .filter(l -> at.isAfter(l.getStartTime()) && at.isBefore(l.getEndTime()))
+                .filter(l -> !at.isBefore(l.getStartTime()) && !at.isAfter(l.getEndTime()))
                 .map(l -> l.getOffender().getId())
                 .collect(java.util.stream.Collectors.toSet());
     }
@@ -353,25 +361,32 @@ public class LeaveService {
      * 定时扫描：已批准且截止时刻已过仍未销假 → 自动升违规。
      * 每 60 秒一次；服务启动 20 秒后先跑一遍。findByStatusAndEndTimeBefore 带悲观锁，
      * 多实例部署不会重复升违规。
+     *
+     * <p>幂等边界：只扫「已批准·假期中」（APPROVED）且 now &gt; endTime 的单。
+     * <ul>
+     *   <li>COMPLETED（按期或逾假后已销假）一律不扫——已销假不能再被翻案成逾假；</li>
+     *   <li>OVERDUE 已在上一轮处理过，不重复生成违规红点/流水、不重复升训诫。</li>
+     * </ul>
      */
     @Scheduled(fixedDelay = 60_000L, initialDelay = 20_000L)
     @Transactional
     public void sweepOverdueLeaves() {
         Instant now = Instant.now();
-        // 已批准、已逾期、已销假但截止时间已过的都扫一遍，确保不漏
-        List<LeaveApplication> due = leaveRepository.findByStatusInOrderByCreatedAtDescIdDesc(List.of(
-                        LeaveApplication.Status.APPROVED,
-                        LeaveApplication.Status.OVERDUE,
-                        LeaveApplication.Status.COMPLETED))
-                .stream()
-                .filter(l -> l.getEndTime().isBefore(now))
-                .toList();
+        List<LeaveApplication> due =
+                leaveRepository.findByStatusAndEndTimeBefore(LeaveApplication.Status.APPROVED, now);
         for (LeaveApplication leave : due) {
             markOverdue(leave, now);
         }
     }
 
     private void markOverdue(LeaveApplication leave, Instant now) {
+        // 双保险幂等：只允许「已批准·假期中」、未登记过逾期、确实已过截止时刻的单进入处置，
+        // 已销假（COMPLETED）/已逾假（OVERDUE）直接跳过，绝不重复登记或翻案。
+        if (leave.getStatus() != LeaveApplication.Status.APPROVED
+                || Boolean.TRUE.equals(leave.getOverdueFlag())
+                || !leave.getEndTime().isBefore(now)) {
+            return;
+        }
         CorrectionObject obj = leave.getOffender();
         leave.setStatus(LeaveApplication.Status.OVERDUE);
         leave.setOverdueFlag(true);

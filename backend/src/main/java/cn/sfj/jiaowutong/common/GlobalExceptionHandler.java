@@ -5,6 +5,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.orm.ObjectOptimisticLockingFailureException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
@@ -29,6 +30,14 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ApiResult<Void>> handleApi(ApiException ex) {
         HttpStatus http = STATUS_MAP.getOrDefault(ex.getCode(), HttpStatus.BAD_REQUEST);
         return ResponseEntity.status(http).body(ApiResult.error(ex.getCode(), ex.getMessage()));
+    }
+
+    /** 两级审批并发提交同一张单：@Version 乐观锁兜底，先提交者生效，后来者得到明确的冲突提示 */
+    @ExceptionHandler(ObjectOptimisticLockingFailureException.class)
+    public ResponseEntity<ApiResult<Void>> handleOptimisticLock(ObjectOptimisticLockingFailureException ex) {
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(ApiResult.error("LEAVE_CONCURRENT_DECISION",
+                        "该请假单刚被另一审批环节处理过，结论已更新，请刷新后按当前环节办理，后提交不会覆盖先提交的结论"));
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)
