@@ -1,0 +1,37 @@
+services:
+  backend:
+    build:
+      context: ./backend
+    image: jiaowutong-backend:1.0.0
+    container_name: jiaowutong-backend
+    ports:
+      - "7104:7104"
+    environment:
+      # H2 文件持久化到卷，重启后数据不丢；重新 build 不影响数据卷
+      SPRING_DATASOURCE_URL: jdbc:h2:file:/data/jwt;DB_CLOSE_ON_EXIT=FALSE
+      JWT_SECRET: jiaowutong-demo-secret-key-please-change-in-prod-0123456789
+      TZ: Asia/Shanghai
+    volumes:
+      - jiaowutong-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/7104' || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 30s
+
+  frontend:
+    build:
+      context: ./frontend
+    image: jiaowutong-frontend:1.0.0
+    container_name: jiaowutong-frontend
+    ports:
+      - "8104:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  jiaowutong-data:

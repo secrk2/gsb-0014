@@ -1,0 +1,42 @@
+server:
+  port: 7104
+  servlet:
+    encoding:
+      charset: UTF-8
+      force: true
+
+spring:
+  application:
+    name: jiaowutong
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:h2:mem:jwt;DB_CLOSE_DELAY=-1}
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
+  jpa:
+    hibernate:
+      ddl-auto: update
+    open-in-view: false
+    properties:
+      hibernate:
+        format_sql: false
+  jackson:
+    serialization:
+      write-dates-as-timestamps: false
+    # 时间戳（Instant）一律序列化为 UTC ISO-8601（带 Z），不随容器 TZ 变化；
+    # 跨时区展示由前端按司法所时区换算
+    time-zone: UTC
+  h2:
+    console:
+      enabled: true
+      path: /h2-console
+
+jwt:
+  # 生产环境通过环境变量 JWT_SECRET 覆盖
+  secret: ${JWT_SECRET:jiaowutong-demo-secret-key-please-change-in-prod-0123456789}
+  # 单位毫秒：12 小时
+  ttl: 43200000
+
+logging:
+  level:
+    cn.sfj.jiaowutong: INFO
